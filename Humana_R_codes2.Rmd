@@ -1,0 +1,420 @@
+---
+title: "Capstone Project - Humana Competition case"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdownsqr
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. 
+
+## 1. Introduction 
+
+Humana is a leading health care company that offers a wide range of insurance products and health and wellness services. 
+	Social Determinants of Health (SDoH) are a key component of Humana’s integrated value-based health ecosystem. 60% of what creates health has to do with the interplay between our socio-economic and community environments and lifestyle behaviors. Humana is seeking that “broader view“ of its members to better understand the whole person and to assist them in new ways towards achieving their best health.   
+	In the absence of regular, universal screening for SDoH, Humana needs to utilize robust data and advanced data science to understand which of our members are struggling with SDoH. This analysis will focus only on Transportation Challenges which is one of the major factors of SDoH. 
+The Expectations: 
+1.	Predictive model -Since screening all Medicare members is challenging, having an effective predictive model to accurately identify members most likely struggling with Transportation Challenges is valuable. Data is provided and can be supplemented with publicly available data.
+2.	Proposed solutions–It is likely that members struggling with Transportation Challenges are not homogeneous and hence there are perhaps different solutions for different segments of members.
+
+
+```{r,message=FALSE, include=FALSE}
+# Load the required libraries
+library(caret) 
+library(ggplot2)
+library(glmnet)
+library(dplyr)
+library(MASS)
+library(caTools)
+#install.packages("randomForest")
+library(randomForest)
+#install.packages("ROCR")
+library(ROCR)
+library(pROC)
+```
+
+
+## 2. Load the Dataset of Humana  
+```{r}
+
+rm(list = ls())
+HumanaComp<-read.csv("2020_Competition_Training.csv")
+#Loading the test data 
+HumanaTest<-read.csv("2020_Competition_Holdout.csv")
+
+```
+## 3. Data Exploration and Visualization 
+##Understanding the Data Structure
+```{r}
+#glimpse(HumanaComp)
+
+```
+* There are total 69572 observations and are of type number, integer and character.
+* There are total 826 variables. The 2nd variable - "transportation_issues" indicates the customers have (1) transportation issue or not(0). 
+ 
+### Missing Values:
+
+```{r}
+# Show the % of missing variables in columns
+MissingColumns <- colMeans(is.na(HumanaComp))
+min(MissingColumns)*100
+max(MissingColumns)*100
+
+# Show the list of columns with missing variables more than 40%
+colnames(HumanaComp)[colMeans(is.na(HumanaComp)) > 0.40]
+
+```
+
+The amount of data missing from columns is from 0% to 99.67%.
+
+```{r}
+# Show the % of missing variables in rows
+MissingRows <- rowMeans(is.na(HumanaComp))
+min(MissingRows)*100
+max(MissingRows)*100
+
+# Show the list of rows with missing variables more than 40%
+rownames(HumanaComp)[rowMeans(is.na(HumanaComp)) > 0.40]
+
+```
+the amount of data missing from rows range is 0% to 15.38%
+
+### Visualize Members with vs without transportation issue
+```{r}
+# Create a bar plot of number of customers that has transpiration issue and those do not 
+
+ggplot(HumanaComp, aes(x=factor(transportation_issues))) +
+  geom_bar(stat="count", width=0.7, fill="steelblue") +
+  labs(title="Non-transport issue Customer vs transport issue Customers") +
+  labs(x="", y="Number of Customers") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_text(stat='count', aes(label=..count..), vjust=2)
+```
+Customers without transportation issue:  59375
+Customers with transportation issue: 10197
+
+
+##4. Data Pre-processing:
+```{r}
+
+#Eliminate the duplicate columns
+Train_Data1 <- HumanaComp[!duplicated(as.list(HumanaComp))] #733 variables
+
+# Eliminate near zero variance variables
+nzv_cols_r <- nearZeroVar(Train_Data1)
+Train_Data2 <- Train_Data1[,-nzv_cols_r]  #404 variables
+
+#Lets check the reduced dataframe 
+dim(Train_Data2)
+
+#Dropping of the columns with more than 40% missing values
+library(VIM)
+Train_Data3<-Train_Data2[,colMeans(is.na(Train_Data2))<0.4] #401 variables
+
+#Lets check the reduced dataframe 
+dim(Train_Data3)
+
+
+```
+
+
+
+```{r}
+#Impute NA values
+
+#Character columns with NULL values
+Train_char<- Train_Data3[sapply(Train_Data3,is.character)]
+#Imputing the missing values using KNN
+Train_char <-kNN(Train_char, k=4)
+
+anyNA(Train_char) 
+Train_char<-Train_char[-c(1,6,7,8,9,15)]
+
+library(dplyr)
+#all other columns other than character ones
+Train_num<-Train_Data3[!sapply(Train_Data3,is.character)]
+
+# Impute the NA values using medianImpute
+impute_model_r <- preProcess(Train_num, method = "medianImpute")
+Train_num<- predict(impute_model_r, Train_num)
+
+anyNA(Train_num) 
+```
+
+
+```{r}
+# Eliminate the highly correlated variables
+corr <- cor(Train_num)
+hc <- findCorrelation(corr, cutoff=0.50) 
+hc <- sort(hc)
+Train_num2 = Train_num[,-c(hc)] #214 variables
+
+Train_data4<-cbind(Train_char,Train_num2) 
+dim(Train_data4)
+#Final reduced variables - 238  
+# we will proceed with the 214 number variables and not with the 24 character variables
+```
+This process model reduced from 826 variable to 238 (24 - character & 214 Number)
+
+Feature Engineering
+
+### Lasso Regression:
+```{r}
+
+#Scaling the data
+#install.packages("normalr")
+library(normalr)
+
+a<-subset(Train_num2, select = -c(transportation_issues))
+a<-normalise(a)
+
+X<- as.matrix(a)
+Y <- as.vector(as.factor(Train_num2$transportation_issues))
+LassoModel <- cv.glmnet(X, Y, alpha = 1, family = "binomial", nfolds = 10, type.measure = "auc")
+
+#Summary of Lasso Model
+summary(LassoModel)
+
+#Plot AUC
+plot(LassoModel)
+```
+
+
+```{r}
+#Coefficient at the minimum lambda value
+LassoModel_coefs <- coef(LassoModel, s = "lambda.min")
+
+#Turn the coefficient values into a data frame
+LassoModel_coefs <- data.frame(name = LassoModel_coefs@Dimnames[[1]][LassoModel_coefs@i + 1], coefficient = LassoModel_coefs@x)
+
+# Get the absolute value of all the coefficients
+LassoModel_coefs$coefficient <- abs(LassoModel_coefs$coefficient)
+
+# Orders the data frame by decreasing value of coefficients in the data frame
+LassoModel_coefs <- LassoModel_coefs[order(LassoModel_coefs$coefficient, decreasing = TRUE), ]
+#LassoModel_coefs
+
+# Remove the intercept from the data frame
+LassoModel_coefs<-filter(LassoModel_coefs, name!="(Intercept)")
+
+# Select the top 20 variables
+LassoModel_coefs_top_20 <- LassoModel_coefs[1:20, ]
+LassoModel_coefs_top_20
+
+# Select the remaining variables for PCA
+LassoModel_coefs_PCA_variables <- LassoModel_coefs[-c(1:20), ]
+
+# Turn names into a vector
+LassoModel_coefs_top_20 <- as.vector(LassoModel_coefs_top_20$name)
+LassoModel_coefs_PCA_variables <- as.vector(LassoModel_coefs_PCA_variables$name)
+
+# Add "transportation_issue" to vector
+LassoModel_coefs_top_20 <- c(LassoModel_coefs_top_20,"transportation_issues")
+LassoModel_coefs_top_20
+```
+
+Lasso returned a total of around 143 variables as important to the default target variable.
+
+
+### Principle Component Analysis:
+```{r}
+set.seed(123)
+# Select other than the top 20 important variables from the lasso variable selection process
+#Append them with the character columns
+#PCAModel <- cbind(Train_num2%>%dplyr::select(LassoModel_coefs_PCA_variables), Train_char)
+PCAModel<-Train_num2%>%dplyr::select(LassoModel_coefs_PCA_variables)
+
+# Create a pre-processing model that eliminates near zero variance variables, highly correlated variables, and then does the imputation of missing values with the median and PCA.
+preProcessModel_PCA <- preProcess(PCAModel, method = c("YeoJohnson", "center", "scale", "pca"), thresh = 0.75)
+PCAModel <- predict(preProcessModel_PCA, PCAModel)
+preProcessModel_PCA
+
+```
+
+69 Components needed to capture 75 percent of the variance leftover in the variables.
+
+
+Splitting Training and Test Data:
+```{r}
+# Merge the Lasso and PCA dataframe
+Train_Data5 <- cbind.data.frame(Train_num2%>%dplyr::select(LassoModel_coefs_top_20), PCAModel)
+
+# Create training and test set
+set.seed(123)
+index <- createDataPartition(Train_Data5$transportation_issues, p = 0.70, list = FALSE)
+train <- Train_Data5[index, ]
+test <- Train_Data5[-index, ]
+
+# Factorize Default variable.
+train$transportation_issues <- as.factor(train$transportation_issues)
+test$transportation_issues <- as.factor(test$transportation_issues)
+
+#glimpse(train)
+```
+
+
+##5. Modeling 
+
+### Random Forest Model:
+```{r}
+set.seed(123)
+RandomForestModel <- randomForest(transportation_issues ~ ., data = train, ntree = 5, mtry = 5)
+print(RandomForestModel)
+```
+
+```{r}
+#Confusion Matrix
+RF <- data.frame(actual = test$transportation_issue,predict(RandomForestModel, newdata = test, type = "prob"))
+RF$predict <- ifelse(RF$X0 > 0.50, 0, 1)
+CM <- confusionMatrix(as.factor(RF$predict), as.factor(RF$actual))
+CM
+```   
+
+```{r}
+#Plot AUC
+set.seed(123)
+Predict <- prediction(RF$X1,test$transportation_issue)
+auc <- performance(Predict, "auc")
+Predict1 <- performance(Predict, "tpr", "fpr")
+plot(Predict1, main = "Random Forest ROC Curve", col = 2, lwd = 2)
+abline(a=0, b=1, lwd=2, lty=2, col="gray")
+
+rf.roc <- roc(test$transportation_issue,RF$X1)
+plot(rf.roc)
+auc(rf.roc)
+```
+
+
+
+Here we again split the cleaned data into train and test.
+
+Split Data by 70 - 30,Train-Test ratio.  
+```{r}
+set.seed(123)
+split=sample.split(Train_Data5$transportation_issues,SplitRatio = 0.7)
+Train = subset(Train_Data5,split==TRUE)
+Test = subset(Train_Data5,split==FALSE)
+```
+
+
+
+### Elastic Net Method
+
+```{r}
+x<- as.matrix(subset(Train, select = -c(transportation_issues)))
+y<-as.vector(Train$transportation_issues)
+ElasticNet <- cv.glmnet(x, y, type.measure = "auc", family = "binomial", alpha = 0.8,)
+summary(ElasticNet)
+max(ElasticNet$cvm)
+
+```
+
+
+```{r}
+predictions <- predict(ElasticNet, newx = as.matrix(Test[,-21]), s = "lambda.min", type = "response") %>% as.vector()
+pred_class <- predict(ElasticNet, newx = as.matrix(Test[,-21]), s = "lambda.min", type = "class") %>% 
+  as.vector() %>% factor(levels = c("0", "1"))
+
+Roc_Result <- roc(Test$transportation_issues, predictions)
+Roc_Result
+plot(Roc_Result)
+```
+
+
+```{r}
+auc(Roc_Result)
+confusionMatrix(pred_class, as.factor(Test$transportation_issues))
+```
+
+### Logistic Regression
+```{r}
+Train_Data_00 <- Train_Data5[Train_Data5$transportation_issues == 0, ]
+Train_Data_11 <- Train_Data5[Train_Data5$transportation_issues == 1, ]
+index_1 <- sample(length(Train_Data_11$transportation_issues == 1))
+index_0 <- sample(length(Train_Data_00$transportation_issues == 0))
+Train_Data_00 <- Train_Data_00[index_0, ]
+Train_Data_11 <- Train_Data_11[index_1, ]
+Data_Full <- as.data.frame(rbind(Train_Data_00, Train_Data_11))
+```
+
+
+```{r}
+split <- createDataPartition(Data_Full$transportation_issues,p=0.70,list = FALSE)
+TrainM2 <- Data_Full[split,]
+TestM2 <- Data_Full[-split,]
+TrainM2$default <- TrainM2$default
+TestM2$default <- TestM2$default
+```
+
+
+```{r}
+CV_MC <- trainControl(method = "cv",number = 5, summaryFunction = twoClassSummary,classProbs = TRUE,verboseIter = TRUE)
+CV_M2 <- train(make.names(transportation_issues)~.,data=TrainM2,method="glmnet",trControl=CV_MC)
+```
+
+
+```{r}
+Pred_M2 <- predict(CV_M2,TestM2[,-21])
+
+Pred_M2ROC <- predict(CV_M2,TestM2[,-21], type = "prob")
+Roc_Result_M2 <- roc(TestM2$transportation_issues, Pred_M2ROC[,2])
+
+plot(Roc_Result_M2,col = "red", lwd = 2)
+
+auc(Roc_Result_M2)
+
+levels(TestM2$transportation_issues) <- c("X0","X1")
+#confusionMatrix(Pred_M2, TestM2$transportation_issues)
+```
+
+### Comparing ROC of all the Models
+```{r}
+plot(Roc_Result_M2,col="red")
+plot(Roc_Result,col="green",add=TRUE)
+plot(rf.roc,col="blue",add=TRUE)
+legend(0.21,0.25, c('Logistic Regression','Elastic Net','Random Forest'),lty=c(1,1),
+lwd=c(2,2),col=c('red','green','blue'))
+```
+
+
+As we can see the logistic model gives the best results, lets apply that to full dataset.
+
+```{r}
+CV_M3 <- train(make.names(transportation_issues)~.,data=Train_num2,method="glmnet",trControl=CV_MC)
+summary(CV_M3)
+
+```
+
+
+Lets apply logistic regression on test dataset
+
+Test Data and Imputation of the NA values
+```{r}
+#HumanaTest is the test data
+
+#all other columns other than character ones
+HumanaTest2<-HumanaTest[!sapply(HumanaTest,is.character)]
+
+# Impute the NA values using medianImpute
+impute_model_r <- preProcess(HumanaTest2, method = "medianImpute")
+HumanaTest2<- predict(impute_model_r, HumanaTest2)
+
+anyNA(HumanaTest2)
+```
+
+Predicting Test data on full train data set
+```{r}
+Pred_M4 <- predict(CV_M3,HumanaTest2)
+summary(Pred_M4)
+```
+
+There are 376 members have transporation issues 
+
+
